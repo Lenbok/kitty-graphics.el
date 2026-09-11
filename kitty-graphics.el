@@ -97,6 +97,9 @@
 (defvar org-comment-regexp)
 (defvar image-mode-map)
 (declare-function markdown-overlays--resolve-image-url "markdown-overlays" (url))
+(declare-function agent-shell-markdown--replace-images "agent-shell-markdown" (&rest args))
+(declare-function agent-shell-markdown--replace-image-file-paths "agent-shell-markdown" (&rest args))
+(declare-function agent-shell-markdown-replace-markup "agent-shell-markdown" (&rest args))
 (declare-function markdown-display-inline-images "markdown-mode" (&optional begin end))
 (declare-function markdown-remove-inline-images "markdown-mode" ())
 (declare-function markdown-toggle-inline-images "markdown-mode" ())
@@ -7082,7 +7085,7 @@ Registers `kitty-image' dispatcher and prepends it to the dispatcher list."
           (assq-delete-all 'kitty-image dirvish--available-preview-dispatchers)))
   (fmakunbound 'dirvish-kitty-image-dp))
 
-;;;; markdown-overlays integration (agent-shell)
+;;;; markdown-overlays integration (agent-shell legacy)
 
 (defun kitty-graphics--markdown-overlays-fontify-image-advice (orig-fn start end url-start url-end)
   "Around advice for `markdown-overlays--fontify-image'.
@@ -7119,6 +7122,120 @@ Falls back to ORIG-FN in GUI."
           (error
            (kitty-graphics--log "markdown-overlays-path error: %s" (error-message-string err)))))
     (funcall orig-fn start end path-start path-end)))
+
+;;;; agent-shell-markdown integration (agent-shell)
+
+(defun kitty-graphics--agent-shell-markdown-place-image (start end spec)
+  "Swap image display SPEC covering START..END for a Kitty placement.
+A no-op when SPEC has no backing file, or the file no longer exists."
+  (when-let* ((path (image-property spec :file))
+              ((file-exists-p path)))
+    (remove-text-properties start end '(display nil))
+    (kitty-graphics--log "agent-shell-markdown-image: %s" path)
+    (condition-case err
+        (kitty-graphics-display-image
+         path start end
+         kitty-graphics-max-width kitty-graphics-max-height)
+      (error
+       (kitty-graphics--log "agent-shell-markdown-image error: %s"
+                        (error-message-string err))))))
+
+(defun kitty-graphics--agent-shell-markdown-replace-image-displays (start end)
+  "Swap every image `display' spec between START and END for a Kitty placement."
+  (save-excursion
+    (let ((pos start))
+      (while (< pos end)
+        (let ((spec (get-text-property pos 'display))
+              (next (or (next-single-property-change pos 'display nil end) end)))
+          (when (eq (car-safe spec) 'image)
+            (kitty-graphics--agent-shell-markdown-place-image pos next spec))
+          (setq pos next))))))
+
+(defun kitty-graphics--agent-shell-markdown-replace-images-advice (orig-fn &rest args)
+  "Around advice shared by the agent-shell-markdown image-replacement passes.
+Runs ORIG-FN (with ARGS) as if a graphical display were available, then
+converts any resulting image display specs into Kitty graphics
+placements.  Falls back to ORIG-FN unmodified in a GUI, or when
+`kitty-graphics-mode' is off."
+  (if (and kitty-graphics-mode (not (display-graphic-p)))
+      (let ((start (point-min-marker))
+            (end (copy-marker (point-max) t)))
+        (unwind-protect
+            (progn
+              ;; `display-graphic-p' is faked so ORIG-FN's `create-image'
+              ;; branch runs.  `image-flush' is a primitive that hard-fails
+              ;; ("Window system frame should be used") on a genuine tty
+              ;; frame regardless of that fake, and is meaningless here
+              ;; anyway (nothing X/Cairo-side was ever cached), so it is
+              ;; stubbed out too.
+              (cl-letf (((symbol-function 'display-graphic-p)
+                         (lambda (&rest _) t))
+                        ((symbol-function 'image-flush)
+                         (lambda (&rest _) nil)))
+                (apply orig-fn args))
+              (kitty-graphics--agent-shell-markdown-replace-image-displays start end))
+          (set-marker start nil)
+          (set-marker end nil)))
+    (apply orig-fn args)))
+
+(defun kitty-graphics-agent-shell-redisplay-images ()
+  "Re-render every image in the current `agent-shell' buffer for this frame.
+
+`agent-shell-markdown--replace-images' and
+`agent-shell-markdown--replace-image-file-paths' consume the raw
+`![alt](url)' (or bare path) markup as they render it, so moving a
+long-lived buffer between a terminal frame and a GUI frame (or the
+reverse) does not update images already rendered under the previous
+frame type: a Kitty placement paints pixels straight to the terminal it
+was made on and shows nothing in a GUI frame, and a native GUI image
+shows nothing in a terminal.  Forcing `agent-shell-markdown-replace-markup'
+alone does not help either, since there is no markup left to re-match --
+only the `agent-shell-markdown-source' text property that
+`agent-shell-copy-as-markdown' round-trips from.
+
+This walks the buffer for runs of that property which are also an
+already-rendered image -- either a `display' image spec (GUI) or a
+region covered by a Kitty graphics overlay (terminal) -- removes the
+Kitty overlay where present, restores the original markup from the
+stashed source, and re-runs `agent-shell-markdown-replace-markup' so
+every one of them renders fresh for whichever kind of frame is now
+selected.
+
+A no-op outside `agent-shell-mode', and when nothing needs redoing."
+  (interactive)
+  (unless (derived-mode-p 'agent-shell-mode)
+    (user-error "Not an agent-shell buffer"))
+  (unless (fboundp 'agent-shell-markdown-replace-markup)
+    (user-error "agent-shell-markdown is not loaded"))
+  (let ((inhibit-read-only t)
+        (regions nil)
+        (pos (point-min)))
+    ;; Collect image runs first (source, start, end), all as plain
+    ;; buffer positions: the reconstruction below processes them
+    ;; highest-start-first so earlier edits never shift a position not
+    ;; yet visited.
+    (while (< pos (point-max))
+      (let* ((source (get-text-property pos 'agent-shell-markdown-source))
+             (next (or (next-single-property-change
+                        pos 'agent-shell-markdown-source nil (point-max))
+                       (point-max))))
+        (when (and source
+                   (or (eq (car-safe (get-text-property pos 'display)) 'image)
+                       (cl-some (lambda (ov) (overlay-get ov 'kitty-graphics))
+                                (overlays-in pos next))))
+          (push (list pos next source) regions))
+        (setq pos next)))
+    (if (null regions)
+        (message "kitty-graphics: no rendered images to redisplay")
+      (setq regions (sort regions (lambda (a b) (> (car a) (car b)))))
+      (dolist (region regions)
+        (pcase-let ((`(,start ,end ,source) region))
+          (kitty-graphics-remove-images start end)
+          (delete-region start end)
+          (goto-char start)
+          (insert source)))
+      (agent-shell-markdown-replace-markup :force t)
+      (message "kitty-graphics: redisplayed %d image(s)" (length regions)))))
 
 ;;;; mpv video integration
 
@@ -8346,6 +8463,11 @@ translated to casty IPC commands."
                 #'kitty-graphics--markdown-overlays-fontify-image-advice)
     (advice-add 'markdown-overlays--fontify-image-file-path :around
                 #'kitty-graphics--markdown-overlays-fontify-image-file-path-advice))
+  (with-eval-after-load 'agent-shell-markdown
+    (advice-add 'agent-shell-markdown--replace-images :around
+                #'kitty-graphics--agent-shell-markdown-replace-images-advice)
+    (advice-add 'agent-shell-markdown--replace-image-file-paths :around
+                #'kitty-graphics--agent-shell-markdown-replace-images-advice))
   (with-eval-after-load 'markdown-mode
     (advice-add 'markdown-display-inline-images :around
                 #'kitty-graphics--markdown-display-advice)
@@ -8397,6 +8519,8 @@ translated to casty IPC commands."
   (advice-remove 'shr-put-image #'kitty-graphics--shr-put-image-advice)
   (advice-remove 'markdown-overlays--fontify-image #'kitty-graphics--markdown-overlays-fontify-image-advice)
   (advice-remove 'markdown-overlays--fontify-image-file-path #'kitty-graphics--markdown-overlays-fontify-image-file-path-advice)
+  (advice-remove 'agent-shell-markdown--replace-images #'kitty-graphics--agent-shell-markdown-replace-images-advice)
+  (advice-remove 'agent-shell-markdown--replace-image-file-paths #'kitty-graphics--agent-shell-markdown-replace-images-advice)
   (advice-remove 'markdown-display-inline-images #'kitty-graphics--markdown-display-advice)
   (advice-remove 'markdown-remove-inline-images #'kitty-graphics--markdown-remove-advice)
   (advice-remove 'markdown-toggle-inline-images #'kitty-graphics--markdown-toggle-advice)
